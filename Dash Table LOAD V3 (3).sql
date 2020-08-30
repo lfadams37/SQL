@@ -1,0 +1,228 @@
+DECLARE @StartDate char(8)
+DECLARE @MISSINGDATES as CHAR(10)
+DECLARE @pyMissingDates as CHAR(10)
+DECLARE @DateCount as tinyint
+
+SET @StartDate = CONVERT(VARCHAR(10),DATEADD(month,-17,GETDATE()),112)											--Change Months to lower number when reloading table then build to 12
+SET @MISSINGDATES = (SELECT 
+						MIN(a.activitydatekey) as activitydatekey
+
+						FROM(SELECT DISTINCT fi.ActivityDateKey 
+						,i.ActivityDateKey	as datekey															--COMMENT IF CREATING TABLE
+
+						FROM [BIDataWarehouse].[edw].[FactsInventory] fi 
+						JOIN [BIDataWarehouse].[edw].DimDate d			ON fi.ActivityDateKey = d.DateKey
+						LEFT JOIN FinancialAnalysis.dbo.InventoryDash i	ON d.DateKey = i.ActivityDateKey			--COMMENT IF CREATING TABLE
+
+						WHERE d.DateKey >=  @StartDate 
+						AND i.ActivityDateKey IS NULL																--COMMENT IF CREATING TABLE
+
+						GROUP BY d.DateKey,fi.ActivityDateKey
+						,i.ActivityDateKey																		--REMOVE IF CREATING TABLE
+
+) a )
+SET @pyMissingDates= CONVERT(VARCHAR(10),DATEADD(YEAR,-1,@MISSINGDATES),112) 
+SET @DateCount =  (SELECT COUNT(@MISSINGDATES) );
+
+--WHILE LOOP START**********************************************************************************************************************************************************************
+WHILE @DateCount = 1
+BEGIN
+
+--CTE START***************************************************************************************************************************************************************************
+With loc AS (	SELECT DISTINCT StoreID, DealerCorpIndicator,StoreName 
+					,CASE WHEN StoreID Between 100 and 900 then LocationTypeDescription
+						WHEN StoreID in ('9111','9141','9151') then LocationTypeDescription
+						ELSE 'Other' END AS LocationTypeDescription
+						FROM [BIDataWarehouse].[edw].[DimStores] ds 
+						where Obsolete = 0
+				)
+	
+, origin as (SELECT DISTINCT  
+					dp.productkey
+					,dp.ProductID
+					,dp.VendorID	
+					--,dp.ShipFromID
+					--,sf.ShipToPosition as sf_ShipToPosition
+					--,sf.CountryID as sf_CountryID
+					,c.Name as c_Name
+					--,v.CountryID as v_CountryID
+					,vc.Name as vc_Name
+					
+					FROM [BIDataWarehouse].[edw].[DimProduct] dp
+
+					FULL JOIN BadcockDW.storis.Vendor_Shipfrom sf	
+						ON dp.VendorID = sf.VendorID 
+						AND dp.ShipFromID = sf.ShipToPosition	
+
+					FULL JOIN BadcockDW.[storis].[DW_Country] c 
+						ON sf.CountryID = c.CountryID
+
+					LEFT JOIN [BIDataWarehouse].[edw].[DimVendor] v											
+						ON dp.VendorID = v.VendorID	 
+
+					LEFT JOIN BadcockDW.[storis].[DW_Country] vc
+						ON v.CountryID = vc.CountryID
+
+					WHERE v.Obsolete = 0 )
+
+--INSERT***************************************************************************************************************************************************************************
+INSERT INTO FinancialAnalysis.dbo.InventoryDash -- INSERT TO TABLE
+
+--QUERY START***************************************************************************************************************************************************************************
+SELECT 
+ ISNULL(cy.ActivityDateKey,py.CYDateKey) as ActivityDateKey
+,ISNULL(cy.Date,py.CYDate) as Date
+,ISNULL(cy.PYDateKey,py.ActivityDateKey) as PYDate
+,ISNULL(cy.LocationTypeDescription,py.LocationTypeDescription) as LocationTypeDescription
+,ISNULL(cy.DealerCorpIndicator,py.DealerCorpIndicator) as DealerCorpIndicator
+,ISNULL(cy.Location, py.Location) as Location
+,ISNULL(cy.Brand, py.Brand) as Brand
+,ISNULL(cy.Category,py.Category) as Category
+,ISNULL(cy.Family, py.Family)	as Family
+,ISNULL(cy.GroupDescription,py.GroupDescription) as 'Group'
+,ISNULL(cy.Country,py.Country)	as Country
+,ISNULL(SUM(cy.QtyOnHand),0)	as QtyOnHand
+,ISNULL(SUM(cy.MaterialCost),0) as MaterialCost
+,ISNULL(cy.Status,py.Status) as Status
+,ISNULL(cy.ProductID,py.ProductID) as ProductID
+,ISNULL(cy.ProductDescription,py.ProductDescription) as ProductDescription
+,ISNULL(cy.CubicFeet,py.CubicFeet) as CubicFeet
+,ISNULL(cy.IsLastDayofMonth,py.IsLastDayofMonth) as LastDayofMonth
+,ISNULL(SUM(py.QtyOnHand),0)	as PYQtyOnHand
+,ISNULL(SUM(py.MaterialCost),0) as PYMaterialCost
+
+	  --INTO FinancialAnalysis.dbo.InventoryDash														--CREATE TABLE
+FROM (
+
+--#################################################################################################################################################################################################
+--CURRENT YEAR DATA
+			SELECT
+			fi.ActivityDateKey				--NEED
+			,d.Date AS 'Date'					
+			,DATEADD(year,-1,d.date) AS PYDate
+			,REPLACE(DATEADD(year,-1,d.date),'-','') AS PYDateKey
+			,l.LocationTypeDescription
+			,l.DealerCorpIndicator
+			,l.StoreName
+			,fi.StoreID
+			,CASE WHEN l.LocationTypeDescription = 'Warehouse'  then l.StoreName else l.DealerCorpIndicator END as 'Location' 
+			,dp.BrandID					as Brand
+			,dp.CategoryID
+			,dp.CategoryDescription 	as Category				
+			,dp.FamilyID				as Family
+			,dp.GroupDescription 
+			,dp.VendorID
+			,CASE WHEN o.c_Name IS NULL then o.vc_Name ELSE o.c_Name END as Country
+			,SUM([QtyOnHand]) as QtyOnHand
+			,SUM(fi.MaterialCost) as MaterialCost
+			,fi.PurchaseStatusID as  'Status'
+			,dp.ProductID
+			,dp.ProductDescription 
+			,dp.CubicFeet
+			,case when d.Date = d.LastDayOfMonth then 'Y' else 'N' end as IsLastDayofMonth
+			,dp.ProductKey
+
+			FROM
+			[BIDataWarehouse].[edw].[FactsInventory] fi
+			JOIN [BIDataWarehouse].[edw].[DimProduct] dp	ON dp.ProductKey = fi.ProductKey			--FAMILYID
+			JOIN loc l										ON l.StoreID = fi.StoreID					--Store vs Warehouse
+			LEFT JOIN origin o								ON o.ProductKey = fi.ProductKey
+			LEFT JOIN BIDataWarehouse.edw.DimDate d			ON d.DateKey = fi.ActivityDateKey
+
+			WHERE
+			fi.ActivityDateKey = @MISSINGDATES
+			AND dp.FamilyID <> 'BULKITEMS'
+			AND [QtyOnHand] <> 0
+
+			GROUP BY
+			fi.[ActivityDateKey],dp.FamilyID,dp.CategoryID,l.LocationTypeDescription,fi.PurchaseStatusID,dp.BrandID
+	  		,dp.VendorID ,o.c_Name,o.vc_Name, dp.CategoryDescription ,dp.ProductDescription ,dp.GroupDescription	,fi.StoreID
+			,dp.GroupID, dp.ProductID,l.DealerCorpIndicator,l.StoreName,dp.CubicFeet,dp.CategoryID,d.LastDayOfMonth,d.Date,dp.ProductKey
+
+) cy
+--#################################################################################################################################################################################################
+-- PRIOR YEAR DATA	(COPY OF ABOVE)
+FULL OUTER JOIN (  SELECT
+			fi.ActivityDateKey				--NEED
+			,d.Date AS 'Date'
+			,DATEADD(year, 1,d.date) AS CYDate	
+			,REPLACE(DATEADD(year,1,d.date),'-','') AS CYDateKey				
+			,l.LocationTypeDescription
+			,l.DealerCorpIndicator
+			,l.StoreName
+			,fi.StoreID
+			,CASE WHEN l.LocationTypeDescription = 'Warehouse'  then l.StoreName else l.DealerCorpIndicator END as 'Location' 
+			,dp.BrandID as Brand
+			,dp.CategoryID
+			,dp.CategoryDescription 	as Category				
+			,dp.FamilyID as Family
+			,dp.GroupDescription 
+			,dp.VendorID
+			,CASE WHEN o.c_Name IS NULL then o.vc_Name ELSE o.c_Name END as Country
+			,SUM([QtyOnHand]) as QtyOnHand
+			,SUM(fi.MaterialCost) as MaterialCost
+			,fi.PurchaseStatusID as  'Status'
+			,dp.ProductID
+			,dp.ProductDescription 
+			,dp.CubicFeet
+			,case when d.Date = d.LastDayOfMonth then 'Y' else 'N' end as IsLastDayofMonth
+			,dp.ProductKey
+			
+			FROM
+			[BIDataWarehouse].[edw].[FactsInventory] fi
+			JOIN [BIDataWarehouse].[edw].[DimProduct] dp	ON dp.ProductKey = fi.ProductKey			--FAMILYID
+			JOIN loc l										ON l.StoreID = fi.StoreID					--Store vs Warehouse
+			LEFT JOIN origin o								ON o.ProductKey = fi.ProductKey
+			LEFT JOIN BIDataWarehouse.edw.DimDate d			ON d.DateKey = fi.ActivityDateKey						
+
+			WHERE
+			fi.ActivityDateKey = '20180105'
+			AND dp.FamilyID <> 'BULKITEMS'
+			AND [QtyOnHand] <> 0
+
+			GROUP BY
+			fi.[ActivityDateKey],dp.FamilyID,dp.CategoryID,l.LocationTypeDescription,fi.PurchaseStatusID,dp.BrandID
+	  			,dp.VendorID ,o.c_Name,o.vc_Name, dp.CategoryDescription ,dp.ProductDescription ,dp.GroupDescription	,fi.StoreID
+				,dp.GroupID, dp.ProductID,l.DealerCorpIndicator,l.StoreName,dp.CubicFeet,dp.CategoryID,d.LastDayOfMonth,d.Date,dp.ProductKey
+						
+			)py		
+						
+			ON cy.PYDateKey = py.ActivityDateKey AND cy.ProductKey = py.ProductKey AND cy.storeid = py.StoreID
+
+--#################################################################################################################################################################################################
+
+GROUP BY
+cy.ActivityDateKey,cy.Date,cy.LocationTypeDescription,cy.DealerCorpIndicator,cy.Location,cy.Brand,cy.Category,cy.Family,cy.GroupDescription,cy.Country,cy.QtyOnHand,cy.MaterialCost,cy.Status
+,cy.ProductID,cy.ProductDescription,cy.CubicFeet,cy.IsLastDayofMonth,cy.PYDate,py.Date,py.CYDateKey,py.LocationTypeDescription,py.Location,py.DealerCorpIndicator,py.Brand,py.Category
+,py.CategoryID,py.Family,py.GroupDescription,py.Country,py.Status,py.ProductID,py.ProductDescription,py.CubicFeet,py.IsLastDayofMonth,py.CYDate,cy.PYDateKey,py.ActivityDateKey
+
+--RESET VARIABLES FOR LOOP*****************************************************************************************************************************************************************
+
+SET @MISSINGDATES = (SELECT 
+						MIN(a.activitydatekey) as activitydatekey
+
+						FROM(SELECT DISTINCT fi.ActivityDateKey ,i.ActivityDateKey	as datekey
+
+						FROM [BIDataWarehouse].[edw].[FactsInventory] fi 
+						JOIN [BIDataWarehouse].[edw].DimDate d			ON fi.ActivityDateKey = d.DateKey
+						LEFT JOIN FinancialAnalysis.dbo.InventoryDash i	ON d.DateKey = i.ActivityDateKey
+
+						WHERE d.DateKey >= @StartDate AND i.ActivityDateKey IS NULL
+
+						GROUP BY d.DateKey,fi.ActivityDateKey,i.ActivityDateKey
+
+) a )
+SET @DateCount =  (SELECT COUNT(@MISSINGDATES) )
+SET @pyMissingDates= CONVERT(VARCHAR(10),DATEADD(year,-1,@MISSINGDATES),112) 
+--BREAK LOOP START***************************************************************************************************************************************************************************
+IF @DateCount <>1 BREAK
+;
+END
+GO
+----DROP TABLE FinancialAnalysis.dbo.InventoryDash  
+----DELETE FROM FinancialAnalysis.dbo.InventoryDash
+
+--;
+----SELECT * FROM FinancialAnalysis.dbo.InventoryDash;
+----SELECT @MISSINGDATES, @pyMissingDates;
+----SELECT DISTINCT ActivityDateKey, COUNT(ActivityDateKey) FROM FinancialAnalysis.dbo.InventoryDash GROUP BY ActivityDateKey			--CHECKS HOW MANY ROWS OF DATA PER DAY
